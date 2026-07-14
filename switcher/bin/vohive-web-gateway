@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Small same-origin gateway that adds USB mode controls to VoHive."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.client import HTTPConnection
+from urllib.parse import urlsplit
+import json
+import subprocess
+
+BACKEND_HOST = "127.0.0.1"
+BACKEND_PORT = 7576
+MODE_SCRIPT = "/usr/local/sbin/vohive-usb-mode"
+
+WIDGET = r'''
+<style>
+#vh-usb-mode-widget{position:fixed;right:24px;bottom:24px;z-index:99999;background:#fff;
+border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 12px 30px #0002;padding:14px;
+font-family:Inter,system-ui,sans-serif;min-width:250px;color:#111827}
+.dark #vh-usb-mode-widget{background:#1f2937;border-color:#374151;color:#f9fafb}
+#vh-usb-mode-widget .t{font-weight:700;margin-bottom:6px}#vh-usb-mode-widget .s{font-size:12px;color:#6b7280;margin-bottom:10px}
+.dark #vh-usb-mode-widget .s{color:#9ca3af}#vh-usb-mode-widget button{border:0;border-radius:8px;padding:8px 10px;margin-right:7px;cursor:pointer;font-weight:600}
+#vh-usb-mode-widget .out{background:#4f46e5;color:white}#vh-usb-mode-widget .back{background:#e5e7eb;color:#111827}
+.dark #vh-usb-mode-widget .back{background:#374151;color:#f9fafb}
+</style>
+<div id="vh-usb-mode-widget"><div class="t">USB 使用模式</div><div id="vh-usb-mode-status" class="s">正在读取状态…</div>
+<button class="out" onclick="vhSwitch('external')">外接网卡模式</button><button class="back" onclick="vhSwitch('vohive')">恢复 VoHive</button></div>
+<script>
+async function vhStatus(){try{let r=await fetch('/__usb_mode/status');let j=await r.json();document.getElementById('vh-usb-mode-status').textContent=j.status}catch(e){document.getElementById('vh-usb-mode-status').textContent='状态暂不可用'}}
+async function vhSwitch(mode){let text=mode==='external'?'切到外接网卡模式后，VoHive 会暂停，随后可拔下模块。确定继续？':'模块插回服务器后将切回 QMI 并自动恢复 VoHive。确定继续？';if(!confirm(text))return;let r=await fetch('/__usb_mode/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});let j=await r.json();alert(j.message||'已发送切换指令');setTimeout(vhStatus,2500)}
+vhStatus();
+</script>
+'''
+
+FALLBACK = """<!doctype html><meta charset=utf-8><title>VoHive USB 模式</title>""" + WIDGET + """<main style='font-family:system-ui;padding:42px'><h2>VoHive 等待模块恢复</h2><p>模块插回服务器后，点击右下角“恢复 VoHive”。</p></main>"""
+
+def mode_status():
+    result = subprocess.run([MODE_SCRIPT, "status"], text=True, capture_output=True, timeout=8)
+    return (result.stdout or result.stderr).strip()
+
+class Gateway(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+    def send_json(self, code, payload):
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+
+    def handle_mode(self):
+        if self.command == "GET" and self.path == "/__usb_mode/status":
+            return self.send_json(200, {"status": mode_status()})
+        if self.command != "POST": return self.send_json(405, {"message": "method not allowed"})
+        mode = self.path.rsplit("/", 1)[-1]
+        if mode not in ("external", "vohive"):
+            return self.send_json(404, {"message": "unknown mode"})
+        subprocess.Popen([MODE_SCRIPT, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        message = "正在切换到外接网卡模式；完成后即可拔下模块。" if mode == "external" else "正在恢复 QMI；模块重启后 VoHive 会自动上线。"
+        return self.send_json(202, {"message": message})
+
+    def forward(self):
+        body = b""
+        if self.headers.get("Content-Length"):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+        headers = {k:v for k,v in self.headers.items() if k.lower() not in {"host","connection","accept-encoding","content-length"}}
+        headers["Host"] = f"{BACKEND_HOST}:{BACKEND_PORT}"
+        try:
+            conn = HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=35)
+            conn.request(self.command, self.path, body=body, headers=headers)
+            resp = conn.getresponse()
+            content_type = resp.getheader("Content-Type", "")
+            if "text/event-stream" in content_type:
+                self.send_response(resp.status, resp.reason)
+                for k,v in resp.getheaders():
+                    if k.lower() not in {"content-length", "connection", "transfer-encoding", "content-encoding"}:
+                        self.send_header(k, v)
+                self.end_headers()
+                try:
+                    while chunk := resp.read(4096):
+                        self.wfile.write(chunk); self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            raw = resp.read()
+            if "text/html" in content_type and self.path in ("/", ""):
+                raw = raw.replace(b"</body>", WIDGET.encode() + b"</body>")
+            self.send_response(resp.status, resp.reason)
+            for k,v in resp.getheaders():
+                if k.lower() not in {"content-length", "connection", "transfer-encoding", "content-encoding"}:
+                    self.send_header(k, v)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            if self.command != "HEAD": self.wfile.write(raw)
+        except Exception:
+            if self.command == "GET" and self.path in ("/", ""):
+                data = FALLBACK.encode(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers()
+                if self.command != "HEAD": self.wfile.write(data)
+            else:
+                self.send_json(503, {"message": "VoHive 正在等待模块或重启"})
+
+    def do_GET(self):
+        self.handle_mode() if self.path.startswith("/__usb_mode/") else self.forward()
+    def do_HEAD(self): self.forward()
+    def do_POST(self):
+        self.handle_mode() if self.path.startswith("/__usb_mode/") else self.forward()
+    def do_PUT(self): self.forward()
+    def do_PATCH(self): self.forward()
+    def do_DELETE(self): self.forward()
+    def do_OPTIONS(self):
+        self.send_response(204); self.send_header("Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"); self.end_headers()
+
+ThreadingHTTPServer(("0.0.0.0", 7575), Gateway).serve_forever()

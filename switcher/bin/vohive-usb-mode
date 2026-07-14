@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Switch the DJI EC25 USB personality between VoHive/QMI and direct ECM.
+# This script is intended to run as root on the home Debian host.
+set -Eeuo pipefail
+
+MODE="${1:-}"
+PORT="${AT_PORT:-/dev/ttyUSB2}"
+LOG_TAG="vohive-usb-mode"
+
+log() { logger -t "$LOG_TAG" -- "$*"; printf '%s\n' "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+[[ "${EUID}" -eq 0 ]] || die "must run as root"
+
+wait_for() {
+  local path="$1" timeout="$2"
+  local i
+  for ((i=0; i<timeout; i++)); do
+    [[ -e "$path" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_qmi() {
+  local timeout="$1" i
+  for ((i=0; i<timeout; i++)); do
+    compgen -G '/dev/cdc-wdm*' >/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+stop_modem_stack() {
+  systemctl stop vohive.service 2>/dev/null || true
+  systemctl stop ModemManager.service 2>/dev/null || true
+}
+
+send_at() {
+  local command="$1"
+  python3 - "$PORT" "$command" <<'PY'
+import serial, sys, time
+port, command = sys.argv[1:]
+s = serial.Serial(port, 115200, timeout=2)
+try:
+    s.reset_input_buffer()
+    s.write((command + '\r').encode())
+    s.flush()
+    time.sleep(0.5)
+    print(s.read(512).decode('ascii', 'replace').strip())
+finally:
+    s.close()
+PY
+}
+
+recover_qmi() {
+  log "waiting for QMI USB device after reset"
+  if ! wait_for_qmi 70; then
+    die "QMI device did not appear within 70 seconds"
+  fi
+  systemctl start ModemManager.service
+  sleep 3
+  systemctl start vohive.service
+  log "QMI_READY: ModemManager and VoHive started"
+}
+
+switch_to() {
+  local target="$1" value
+  case "$target" in
+    ecm) value=1 ;;
+    qmi) value=0 ;;
+    *) die "unsupported target: $target" ;;
+  esac
+
+  stop_modem_stack
+  wait_for "$PORT" 20 || die "AT port $PORT not found; insert the module first"
+
+  if [[ "$target" == qmi ]]; then
+    # Continue independently because changing USB mode may immediately drop SSH I/O.
+    nohup "$0" recover >/var/log/vohive-usb-mode-recover.log 2>&1 &
+    log "QMI recovery task scheduled"
+  fi
+
+  log "switching USB network mode to $target"
+  # Some firmware resets immediately after QCFG; an I/O error after this write is expected.
+  send_at "AT+QCFG=\"usbnet\",$value" || true
+  sleep 1
+  # If the port survives the first command, explicitly reset the modem.
+  send_at "AT+CFUN=1,1" || true
+
+  if [[ "$target" == ecm ]]; then
+    log "ECM_READY: unplug the module and connect it to a phone or computer"
+  else
+    log "QMI_SWITCH_SENT: wait for automatic VoHive recovery"
+  fi
+}
+
+case "$MODE" in
+  ecm|external) switch_to ecm ;;
+  qmi|vohive) switch_to qmi ;;
+  recover) recover_qmi ;;
+  status)
+    printf 'ttyUSB2=%s qmi_usb=%s vohive=%s modemmanager=%s\n' \
+      "$([[ -e /dev/ttyUSB2 ]] && echo present || echo absent)" \
+      "$(compgen -G '/dev/cdc-wdm*' >/dev/null && echo present || echo absent)" \
+      "$(systemctl is-active vohive.service 2>/dev/null || true)" \
+      "$(systemctl is-active ModemManager.service 2>/dev/null || true)"
+    ;;
+  *) die "usage: $0 {external|vohive|status}" ;;
+esac
